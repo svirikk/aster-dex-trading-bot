@@ -16,10 +16,60 @@ class AsterdexService {
     
     this._lastMs = 0;
     this._i = 0;
+    
+    // ✅ Time synchronization
+    this.serverTimeOffset = 0; // різниця між server time і local time (ms)
+    this.lastTimeSyncAt = 0;
+    this.timeSyncInterval = 60000; // синхронізуємо час кожну хвилину
+  }
+
+  /**
+   * Синхронізує час з сервером AsterDex
+   */
+  async syncServerTime() {
+    try {
+      const startTime = Date.now();
+      const response = await this.publicRequest('GET', '/fapi/v1/time');
+      const endTime = Date.now();
+      
+      const serverTime = response.serverTime;
+      const localTime = Math.floor((startTime + endTime) / 2); // усереднений час з урахуванням затримки
+      
+      this.serverTimeOffset = serverTime - localTime;
+      this.lastTimeSyncAt = Date.now();
+      
+      logger.info(`[ASTERDEX] Time synced: offset = ${this.serverTimeOffset}ms`);
+      
+      if (Math.abs(this.serverTimeOffset) > 1000) {
+        logger.warn(`[ASTERDEX] Large time offset detected: ${this.serverTimeOffset}ms`);
+      }
+      
+      return this.serverTimeOffset;
+    } catch (error) {
+      logger.error(`[ASTERDEX] Failed to sync time: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Отримує синхронізований час
+   */
+  getServerTime() {
+    return Date.now() + this.serverTimeOffset;
+  }
+
+  /**
+   * Перевіряє чи потрібна повторна синхронізація часу
+   */
+  async ensureTimeSync() {
+    const now = Date.now();
+    if (now - this.lastTimeSyncAt > this.timeSyncInterval) {
+      await this.syncServerTime();
+    }
   }
 
   getNonce() {
-    const nowMs = Math.floor(Date.now());
+    const nowMs = Math.floor(this.getServerTime()); // ✅ використовуємо синхронізований час
     
     if (nowMs === this._lastMs) {
       this._i += 1;
@@ -79,6 +129,9 @@ class AsterdexService {
    */
   async signedRequest(method, endpoint, params = {}) {
     try {
+      // ✅ Перевіряємо синхронізацію часу перед кожним підписаним запитом
+      await this.ensureTimeSync();
+
       // Rate limiting
       const now = Date.now();
       const timeSinceLastRequest = now - this.lastRequestTime;
@@ -163,8 +216,15 @@ class AsterdexService {
 
       logger.error(`[ASTERDEX] API Error ${status}: Code ${code}, Message: ${msg}`);
 
-      if (code === -1021) {
-        throw new Error(`Timestamp sync error: ${msg}`);
+      // ✅ При помилці синхронізації часу - примусово синхронізуємо
+      if (code === -1000 || code === -1021) {
+        logger.warn('[ASTERDEX] Time sync error detected, forcing resync...');
+        try {
+          await this.syncServerTime();
+          throw new Error(`Time sync error: ${msg}. Time has been resynced, please retry.`);
+        } catch (syncError) {
+          throw new Error(`Time sync failed: ${syncError.message}`);
+        }
       }
 
       if (code === -429 || status === 429) {
@@ -194,15 +254,10 @@ class AsterdexService {
       
       await this.publicRequest('GET', '/fapi/v1/ping');
       
-      const timeResponse = await this.publicRequest('GET', '/fapi/v1/time');
-      const serverTime = timeResponse.serverTime;
-      const localTime = Date.now();
-      const timeDiff = Math.abs(serverTime - localTime);
+      // ✅ Синхронізуємо час при підключенні
+      await this.syncServerTime();
       
-      if (timeDiff > 5000) {
-        logger.warn(`[ASTERDEX] Time difference with server: ${timeDiff}ms`);
-      }
-      
+      // Тестуємо підписаний запит
       await this.getUSDTBalance();
       
       this.isConnected = true;
