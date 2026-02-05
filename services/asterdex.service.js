@@ -32,22 +32,10 @@ class AsterdexService {
   }
 
   /**
-   * ⚠️ ВИПРАВЛЕНО: Параметри НЕ сортуються, використовується порядок додавання
+   * Створює EIP-712 Web3 підпис
    */
-  async createWeb3Signature(params) {
+  async createWeb3Signature(paramString) {
     try {
-      const nonce = this.getNonce();
-      
-      // ✅ ВИПРАВЛЕНО: Створюємо query string БЕЗ сортування
-      const paramString = Object.keys(params)
-        .map(key => `${key}=${params[key]}`)
-        .join('&');
-      
-      // Додаємо nonce, user, signer в КІНЦІ
-      const finalParamString = `${paramString}&nonce=${nonce}&user=${this.userAddress}&signer=${this.signerAddress}`;
-      
-      logger.debug(`[ASTERDEX] Param string: ${finalParamString}`);
-
       const typedData = {
         types: {
           EIP712Domain: [
@@ -68,7 +56,7 @@ class AsterdexService {
           verifyingContract: "0x0000000000000000000000000000000000000000"
         },
         message: {
-          msg: finalParamString
+          msg: paramString
         }
       };
 
@@ -79,19 +67,19 @@ class AsterdexService {
         typedData.message
       );
 
-      return {
-        nonce,
-        signature,
-        paramString: finalParamString
-      };
+      return signature;
     } catch (error) {
       logger.error(`[ASTERDEX] Error creating Web3 signature: ${error.message}`);
       throw error;
     }
   }
 
+  /**
+   * Виконує підписаний запит
+   */
   async signedRequest(method, endpoint, params = {}) {
     try {
+      // Rate limiting
       const now = Date.now();
       const timeSinceLastRequest = now - this.lastRequestTime;
       if (timeSinceLastRequest < this.minRequestInterval) {
@@ -99,41 +87,41 @@ class AsterdexService {
       }
       this.lastRequestTime = Date.now();
 
-      const { nonce, signature, paramString } = await this.createWeb3Signature(params);
+      const nonce = this.getNonce();
       
-      // Формуємо фінальні параметри
-      const finalParams = {
-        ...params,
-        nonce: nonce.toString(),
-        user: this.userAddress,
-        signer: this.signerAddress,
-        signature
-      };
+      // Формуємо параметри в правильному порядку
+      let paramParts = [];
+      
+      // 1. Спочатку бізнес-параметри
+      for (const key in params) {
+        paramParts.push(`${key}=${params[key]}`);
+      }
+      
+      // 2. Додаємо nonce, user, signer
+      paramParts.push(`nonce=${nonce}`);
+      paramParts.push(`user=${this.userAddress}`);
+      paramParts.push(`signer=${this.signerAddress}`);
+      
+      const paramString = paramParts.join('&');
+      
+      logger.debug(`[ASTERDEX] Param string: ${paramString}`);
+
+      // 3. Створюємо підпис
+      const signature = await this.createWeb3Signature(paramString);
+      
+      // 4. Формуємо фінальний URL/body з підписом
+      const finalUrl = `${this.baseURL}${endpoint}?${paramString}&signature=${signature}`;
 
       const requestConfig = {
         method,
-        url: `${this.baseURL}${endpoint}`,
+        url: finalUrl,
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           'User-Agent': 'AsterDexBot/1.0'
         }
       };
 
-      if (method === 'GET' || method === 'DELETE') {
-        const queryString = Object.keys(finalParams)
-          .map(key => `${key}=${encodeURIComponent(finalParams[key])}`)
-          .join('&');
-        requestConfig.url += `?${queryString}`;
-      } else {
-        // ✅ ВИПРАВЛЕНО: Для POST використовуємо URLSearchParams
-        const formData = new URLSearchParams();
-        Object.keys(finalParams).forEach(key => {
-          formData.append(key, finalParams[key]);
-        });
-        requestConfig.data = formData.toString();
-      }
-
-      logger.debug(`[ASTERDEX] Request URL: ${requestConfig.url}`);
+      logger.debug(`[ASTERDEX] Request: ${method} ${finalUrl}`);
 
       const response = await axios(requestConfig);
       
@@ -253,8 +241,238 @@ class AsterdexService {
     }
   }
 
-  // ... решта методів залишається без змін
-  // (getSymbolInfo, getCurrentPrice, setLeverage, openMarketOrder, і т.д.)
+  async getSymbolInfo(symbol) {
+    try {
+      const response = await this.publicRequest('GET', '/fapi/v3/exchangeInfo');
+      
+      const symbolData = response.symbols?.find(s => s.symbol === symbol);
+      
+      if (!symbolData) {
+        throw new Error(`Symbol ${symbol} not found`);
+      }
+
+      const priceFilter = symbolData.filters?.find(f => f.filterType === 'PRICE_FILTER');
+      const lotSizeFilter = symbolData.filters?.find(f => f.filterType === 'LOT_SIZE');
+      const minNotional = symbolData.filters?.find(f => f.filterType === 'MIN_NOTIONAL');
+
+      return {
+        symbol: symbolData.symbol,
+        status: symbolData.status || symbolData.contractStatus,
+        baseAsset: symbolData.baseAsset,
+        quoteAsset: symbolData.quoteAsset,
+        pricePrecision: symbolData.pricePrecision || 4,
+        quantityPrecision: symbolData.quantityPrecision || 4,
+        tickSize: parseFloat(priceFilter?.tickSize || '0.01'),
+        stepSize: parseFloat(lotSizeFilter?.stepSize || '0.001'),
+        minQty: parseFloat(lotSizeFilter?.minQty || '0'),
+        maxQty: parseFloat(lotSizeFilter?.maxQty || '999999999'),
+        minNotional: parseFloat(minNotional?.notional || '0')
+      };
+    } catch (error) {
+      logger.error(`[ASTERDEX] Error getting symbol info for ${symbol}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async getCurrentPrice(symbol) {
+    try {
+      const response = await this.publicRequest('GET', '/fapi/v3/ticker/price', { symbol });
+      
+      const price = parseFloat(response.price);
+      logger.info(`[ASTERDEX] Current price for ${symbol}: ${price}`);
+      
+      return price;
+    } catch (error) {
+      logger.error(`[ASTERDEX] Error getting current price for ${symbol}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async setLeverage(symbol, leverage) {
+    try {
+      logger.info(`[ASTERDEX] Setting leverage ${leverage}x for ${symbol}...`);
+      
+      const response = await this.signedRequest('POST', '/fapi/v3/leverage', {
+        symbol,
+        leverage: leverage.toString()
+      });
+
+      logger.info(`[ASTERDEX] ✅ Leverage ${leverage}x set for ${symbol}`);
+      return response;
+    } catch (error) {
+      if (error.message?.includes('leverage not modified') || 
+          error.message?.includes('No need to change leverage')) {
+        logger.info(`[ASTERDEX] ✅ Leverage already ${leverage}x for ${symbol}`);
+        return { leverage, symbol };
+      }
+      
+      logger.error(`[ASTERDEX] Error setting leverage: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async openMarketOrder(symbol, side, quantity, positionSide = 'BOTH') {
+    try {
+      logger.info(`[ASTERDEX] Opening ${side} market order: ${quantity} ${symbol}...`);
+      
+      const params = {
+        symbol,
+        side,
+        type: 'MARKET',
+        quantity: quantity.toString(),
+        positionSide
+      };
+
+      const response = await this.signedRequest('POST', '/fapi/v3/order', params);
+
+      const orderId = response.orderId;
+      const avgPrice = parseFloat(response.avgPrice || '0');
+      
+      logger.info(`[ASTERDEX] ✅ Market order opened: Order ID ${orderId}, Avg Price: ${avgPrice}`);
+      
+      return {
+        orderId,
+        symbol,
+        side,
+        quantity,
+        avgPrice,
+        status: response.status
+      };
+    } catch (error) {
+      logger.error(`[ASTERDEX] Error opening market order: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async setTakeProfit(symbol, side, price, quantity, positionSide = 'BOTH') {
+    try {
+      logger.info(`[ASTERDEX] Setting Take Profit: @ ${price} for ${symbol}...`);
+      
+      const tpSide = side === 'BUY' ? 'SELL' : 'BUY';
+      
+      const params = {
+        symbol,
+        side: tpSide,
+        positionSide,
+        type: 'TAKE_PROFIT',
+        quantity: quantity.toString(),
+        price: price.toString(),
+        stopPrice: price.toString(),
+        timeInForce: 'GTC',
+        workingType: 'CONTRACT_PRICE'
+      };
+
+      const response = await this.signedRequest('POST', '/fapi/v3/order', params);
+
+      logger.info(`[ASTERDEX] ✅ Take Profit set: Order ID ${response.orderId}`);
+      
+      return {
+        orderId: response.orderId,
+        price,
+        type: 'TAKE_PROFIT'
+      };
+    } catch (error) {
+      logger.error(`[ASTERDEX] Error setting Take Profit: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async setStopLoss(symbol, side, price, quantity, positionSide = 'BOTH') {
+    try {
+      logger.info(`[ASTERDEX] Setting Stop Loss: @ ${price} for ${symbol}...`);
+      
+      const slSide = side === 'BUY' ? 'SELL' : 'BUY';
+      
+      const params = {
+        symbol,
+        side: slSide,
+        positionSide,
+        type: 'STOP',
+        quantity: quantity.toString(),
+        price: price.toString(),
+        stopPrice: price.toString(),
+        timeInForce: 'GTC',
+        workingType: 'CONTRACT_PRICE'
+      };
+
+      const response = await this.signedRequest('POST', '/fapi/v3/order', params);
+
+      logger.info(`[ASTERDEX] ✅ Stop Loss set: Order ID ${response.orderId}`);
+      
+      return {
+        orderId: response.orderId,
+        price,
+        type: 'STOP'
+      };
+    } catch (error) {
+      logger.error(`[ASTERDEX] Error setting Stop Loss: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async getOpenPositions(symbol = null) {
+    try {
+      const params = symbol ? { symbol } : {};
+      const response = await this.signedRequest('GET', '/fapi/v3/positionRisk', params);
+
+      if (!Array.isArray(response)) {
+        throw new Error('Invalid position response format');
+      }
+
+      const positions = response
+        .filter(pos => Math.abs(parseFloat(pos.positionAmt || '0')) > 0)
+        .map(pos => ({
+          symbol: pos.symbol,
+          positionSide: pos.positionSide,
+          positionAmt: parseFloat(pos.positionAmt || '0'),
+          entryPrice: parseFloat(pos.entryPrice || '0'),
+          markPrice: parseFloat(pos.markPrice || '0'),
+          unRealizedProfit: parseFloat(pos.unRealizedProfit || '0'),
+          liquidationPrice: parseFloat(pos.liquidationPrice || '0'),
+          leverage: parseFloat(pos.leverage || '1'),
+          side: parseFloat(pos.positionAmt || '0') > 0 ? 'LONG' : 'SHORT',
+          size: Math.abs(parseFloat(pos.positionAmt || '0'))
+        }));
+
+      return positions;
+    } catch (error) {
+      logger.error(`[ASTERDEX] Error getting open positions: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async hasOpenPosition(symbol) {
+    const positions = await this.getOpenPositions(symbol);
+    return positions.length > 0;
+  }
+
+  async getTradeHistory(symbol = null, limit = 50) {
+    try {
+      const params = { limit };
+      if (symbol) {
+        params.symbol = symbol;
+      }
+
+      const response = await this.signedRequest('GET', '/fapi/v3/userTrades', params);
+
+      return Array.isArray(response) ? response : [];
+    } catch (error) {
+      logger.error(`[ASTERDEX] Error getting trade history: ${error.message}`);
+      throw error;
+    }
+  }
+
+  getPositionSide(direction) {
+    const mode = (config.asterdex.positionMode || 'ONE_WAY').toUpperCase();
+    if (mode === 'HEDGE') {
+      return direction;
+    }
+    return 'BOTH';
+  }
+
+  getOrderSide(direction) {
+    return direction === 'LONG' ? 'BUY' : 'SELL';
+  }
 }
 
 const asterdexService = new AsterdexService();
