@@ -14,62 +14,18 @@ class AsterdexService {
     this.lastRequestTime = 0;
     this.minRequestInterval = 100;
     
+    // ✅ Згідно з документацією AsterDex
     this._lastMs = 0;
     this._i = 0;
-    
-    // ✅ Time synchronization
-    this.serverTimeOffset = 0; // різниця між server time і local time (ms)
-    this.lastTimeSyncAt = 0;
-    this.timeSyncInterval = 60000; // синхронізуємо час кожну хвилину
   }
 
   /**
-   * Синхронізує час з сервером AsterDex
+   * ✅ КРИТИЧНО: Генерує nonce в МІКРОСЕКУНДАХ згідно з документацією AsterDex
+   * Документація: "The nonce parameter is the current system time in microseconds"
+   * "If it exceeds the system time or lags behind it by more than 5 seconds, the request is considered invalid"
    */
-  async syncServerTime() {
-    try {
-      const startTime = Date.now();
-      const response = await this.publicRequest('GET', '/fapi/v1/time');
-      const endTime = Date.now();
-      
-      const serverTime = response.serverTime;
-      const localTime = Math.floor((startTime + endTime) / 2); // усереднений час з урахуванням затримки
-      
-      this.serverTimeOffset = serverTime - localTime;
-      this.lastTimeSyncAt = Date.now();
-      
-      logger.info(`[ASTERDEX] Time synced: offset = ${this.serverTimeOffset}ms`);
-      
-      if (Math.abs(this.serverTimeOffset) > 1000) {
-        logger.warn(`[ASTERDEX] Large time offset detected: ${this.serverTimeOffset}ms`);
-      }
-      
-      return this.serverTimeOffset;
-    } catch (error) {
-      logger.error(`[ASTERDEX] Failed to sync time: ${error.message}`);
-      throw error;
-    }
-  }
-
-  /**
-   * Отримує синхронізований час
-   */
-  getServerTime() {
-    return Date.now() + this.serverTimeOffset;
-  }
-
-  /**
-   * Перевіряє чи потрібна повторна синхронізація часу
-   */
-  async ensureTimeSync() {
-    const now = Date.now();
-    if (now - this.lastTimeSyncAt > this.timeSyncInterval) {
-      await this.syncServerTime();
-    }
-  }
-
   getNonce() {
-    const nowMs = Math.floor(this.getServerTime()); // ✅ використовуємо синхронізований час
+    const nowMs = Math.floor(Date.now()); // поточний час в мілісекундах
     
     if (nowMs === this._lastMs) {
       this._i += 1;
@@ -78,11 +34,12 @@ class AsterdexService {
       this._i = 0;
     }
     
+    // ✅ Перетворюємо мілісекунди в МІКРОсекунди: ms * 1,000,000
     return nowMs * 1_000_000 + this._i;
   }
 
   /**
-   * Створює EIP-712 Web3 підпис
+   * Створює EIP-712 Web3 підпис згідно з документацією
    */
   async createWeb3Signature(paramString) {
     try {
@@ -125,13 +82,10 @@ class AsterdexService {
   }
 
   /**
-   * Виконує підписаний запит
+   * Виконує підписаний запит згідно з документацією AsterDex
    */
   async signedRequest(method, endpoint, params = {}) {
     try {
-      // ✅ Перевіряємо синхронізацію часу перед кожним підписаним запитом
-      await this.ensureTimeSync();
-
       // Rate limiting
       const now = Date.now();
       const timeSinceLastRequest = now - this.lastRequestTime;
@@ -142,18 +96,20 @@ class AsterdexService {
 
       const nonce = this.getNonce();
       
-      // Формуємо параметри в правильному порядку
+      // ✅ Формуємо параметри ТОЧНО як в документації:
+      // "After converting the API parameters to strings, sort them by their key values in ASCII order"
       let paramParts = [];
       
-      // 1. Спочатку бізнес-параметри
-      for (const key in params) {
+      // 1. Спочатку бізнес-параметри (вже відсортовані по ключу)
+      const sortedKeys = Object.keys(params).sort();
+      for (const key of sortedKeys) {
         paramParts.push(`${key}=${params[key]}`);
       }
       
-      // 2. Додаємо nonce, user, signer
+      // 2. Додаємо nonce, user, signer (в правильному порядку для ASCII sort)
       paramParts.push(`nonce=${nonce}`);
-      paramParts.push(`user=${this.userAddress}`);
       paramParts.push(`signer=${this.signerAddress}`);
+      paramParts.push(`user=${this.userAddress}`);
       
       const paramString = paramParts.join('&');
       
@@ -162,7 +118,7 @@ class AsterdexService {
       // 3. Створюємо підпис
       const signature = await this.createWeb3Signature(paramString);
       
-      // 4. Формуємо фінальний URL/body з підписом
+      // 4. Формуємо фінальний URL з підписом
       const finalUrl = `${this.baseURL}${endpoint}?${paramString}&signature=${signature}`;
 
       const requestConfig = {
@@ -174,7 +130,7 @@ class AsterdexService {
         }
       };
 
-      logger.debug(`[ASTERDEX] Request: ${method} ${finalUrl}`);
+      logger.debug(`[ASTERDEX] Request: ${method} ${endpoint}`);
 
       const response = await axios(requestConfig);
       
@@ -216,15 +172,8 @@ class AsterdexService {
 
       logger.error(`[ASTERDEX] API Error ${status}: Code ${code}, Message: ${msg}`);
 
-      // ✅ При помилці синхронізації часу - примусово синхронізуємо
       if (code === -1000 || code === -1021) {
-        logger.warn('[ASTERDEX] Time sync error detected, forcing resync...');
-        try {
-          await this.syncServerTime();
-          throw new Error(`Time sync error: ${msg}. Time has been resynced, please retry.`);
-        } catch (syncError) {
-          throw new Error(`Time sync failed: ${syncError.message}`);
-        }
+        throw new Error(`Time sync error: ${msg}. Please check your system time.`);
       }
 
       if (code === -429 || status === 429) {
@@ -254,10 +203,17 @@ class AsterdexService {
       
       await this.publicRequest('GET', '/fapi/v1/ping');
       
-      // ✅ Синхронізуємо час при підключенні
-      await this.syncServerTime();
+      const timeResponse = await this.publicRequest('GET', '/fapi/v1/time');
+      const serverTime = timeResponse.serverTime;
+      const localTime = Date.now();
+      const timeDiff = Math.abs(serverTime - localTime);
       
-      // Тестуємо підписаний запит
+      if (timeDiff > 5000) {
+        logger.warn(`[ASTERDEX] ⚠️ Time difference with server: ${timeDiff}ms (should be < 5000ms)`);
+      } else {
+        logger.info(`[ASTERDEX] ✅ Time sync OK: difference ${timeDiff}ms`);
+      }
+      
       await this.getUSDTBalance();
       
       this.isConnected = true;
