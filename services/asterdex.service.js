@@ -1,32 +1,112 @@
 import axios from 'axios';
-import crypto from 'crypto';
 import { config } from '../config/settings.js';
 import logger from '../utils/logger.js';
 
+// ⚠️ CRITICAL: AsterDex використовує Web3 автентифікацію!
+// Потрібно встановити: npm install ethers@^6
+
+import { ethers } from 'ethers';
+
 class AsterdexService {
   constructor() {
-    this.apiKey = config.asterdex.apiKey;
-    this.apiSecret = config.asterdex.apiSecret;
+    // ⚠️ ЗМІНЕНО: AsterDex потребує wallet addresses та private key
+    this.userAddress = config.asterdex.userAddress;  // Main wallet address
+    this.signerAddress = config.asterdex.signerAddress;  // API wallet address
+    this.privateKey = config.asterdex.privateKey;  // Private key API wallet
     this.baseURL = config.asterdex.baseURL;
     this.isConnected = false;
     
     // Rate limiting tracking
     this.lastRequestTime = 0;
-    this.minRequestInterval = 100; // 100ms between requests
+    this.minRequestInterval = 100;
+    
+    // Nonce tracking для унікальності
+    this._lastMs = 0;
+    this._i = 0;
   }
 
   /**
-   * Створює підпис HMAC SHA256 для запиту
+   * Генерує унікальний nonce в мікросекундах
    */
-  createSignature(queryString) {
-    return crypto
-      .createHmac('sha256', this.apiSecret)
-      .update(queryString)
-      .digest('hex');
+  getNonce() {
+    const nowMs = Math.floor(Date.now());
+    
+    if (nowMs === this._lastMs) {
+      this._i += 1;
+    } else {
+      this._lastMs = nowMs;
+      this._i = 0;
+    }
+    
+    return nowMs * 1_000_000 + this._i;
   }
 
   /**
-   * Виконує підписаний запит до API
+   * Створює EIP-712 підпис для запиту (Web3 автентифікація)
+   */
+  async createWeb3Signature(params) {
+    try {
+      // 1. Додаємо nonce, user, signer
+      const nonce = this.getNonce();
+      const allParams = {
+        ...params,
+        nonce: nonce.toString(),
+        user: this.userAddress,
+        signer: this.signerAddress
+      };
+
+      // 2. Сортуємо параметри по ключах (ASCII order)
+      const sortedKeys = Object.keys(allParams).sort();
+      const paramString = sortedKeys
+        .map(key => `${key}=${allParams[key]}`)
+        .join('&');
+
+      // 3. Створюємо EIP-712 typed data
+      const typedData = {
+        types: {
+          EIP712Domain: [
+            { name: "name", type: "string" },
+            { name: "version", type: "string" },
+            { name: "chainId", type: "uint256" },
+            { name: "verifyingContract", type: "address" }
+          ],
+          Message: [
+            { name: "msg", type: "string" }
+          ]
+        },
+        primaryType: "Message",
+        domain: {
+          name: "AsterSignTransaction",
+          version: "1",
+          chainId: 1666,
+          verifyingContract: "0x0000000000000000000000000000000000000000"
+        },
+        message: {
+          msg: paramString
+        }
+      };
+
+      // 4. Підписуємо через ethers.js
+      const wallet = new ethers.Wallet(this.privateKey);
+      const signature = await wallet.signTypedData(
+        typedData.domain,
+        { Message: typedData.types.Message },
+        typedData.message
+      );
+
+      return {
+        params: allParams,
+        signature,
+        paramString
+      };
+    } catch (error) {
+      logger.error(`[ASTERDEX] Error creating Web3 signature: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Виконує підписаний запит до API (Web3 authentication)
    */
   async signedRequest(method, endpoint, params = {}) {
     try {
@@ -38,51 +118,38 @@ class AsterdexService {
       }
       this.lastRequestTime = Date.now();
 
-      const timestamp = Date.now();
-      const recvWindow = 5000; // 5 seconds
-      const allParams = { ...params, timestamp, recvWindow };
+      // Створюємо Web3 підпис
+      const { params: signedParams, signature } = await this.createWeb3Signature(params);
       
-      // Створюємо query string
-      const queryString = Object.keys(allParams)
-        .sort() // Сортуємо для консистентності
-        .map(key => `${key}=${allParams[key]}`)
-        .join('&');
-      
-      // Створюємо підпис
-      const signature = this.createSignature(queryString);
-      const finalQuery = `${queryString}&signature=${signature}`;
-      
-      // Формуємо URL
-      const url = method === 'GET' || method === 'DELETE'
-        ? `${this.baseURL}${endpoint}?${finalQuery}`
-        : `${this.baseURL}${endpoint}`;
+      // Додаємо підпис
+      signedParams.signature = signature;
 
       const requestConfig = {
         method,
-        url,
+        url: `${this.baseURL}${endpoint}`,
         headers: {
-          'X-MBX-APIKEY': this.apiKey,
-          'Content-Type': 'application/x-www-form-urlencoded'
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'AsterDexBot/1.0'
         }
       };
 
-      // Для POST/PUT передаємо дані в body
-      if (method === 'POST' || method === 'PUT') {
-        requestConfig.data = finalQuery;
+      // Для GET/DELETE - параметри в URL
+      if (method === 'GET' || method === 'DELETE') {
+        const queryString = Object.keys(signedParams)
+          .map(key => `${key}=${encodeURIComponent(signedParams[key])}`)
+          .join('&');
+        requestConfig.url += `?${queryString}`;
+      } else {
+        // Для POST/PUT - параметри в body
+        requestConfig.data = signedParams;
       }
 
       const response = await axios(requestConfig);
       
-      // Перевіряємо rate limits з headers
+      // Перевіряємо rate limits
       const usedWeight = response.headers['x-mbx-used-weight-1m'];
-      const orderCount = response.headers['x-mbx-order-count-1m'];
-      
       if (usedWeight && parseInt(usedWeight) > 2000) {
         logger.warn(`[ASTERDEX] High API weight usage: ${usedWeight}/2400`);
-      }
-      
-      if (orderCount && parseInt(orderCount) > 1000) {
-        logger.warn(`[ASTERDEX] High order count: ${orderCount}/1200`);
       }
 
       return response.data;
@@ -128,27 +195,21 @@ class AsterdexService {
 
       logger.error(`[ASTERDEX] API Error ${status}: Code ${code}, Message: ${msg}`);
 
-      // Retry логіка для певних помилок
       if (code === -1021) {
-        // INVALID_TIMESTAMP - sync часу
-        logger.warn('[ASTERDEX] Timestamp sync issue detected');
         throw new Error(`Timestamp sync error: ${msg}`);
       }
 
       if (code === -429 || status === 429) {
-        // TOO_MANY_REQUESTS
         logger.warn('[ASTERDEX] Rate limit hit, waiting...');
         await new Promise(resolve => setTimeout(resolve, 1000));
         throw new Error('Rate limit exceeded, please retry');
       }
 
       if (code === -2019) {
-        // MARGIN_NOT_SUFFICIENT
         throw new Error(`Insufficient margin: ${msg}`);
       }
 
       if (code === -4131) {
-        // MARKET_ORDER_REJECT
         throw new Error(`Market order rejected: ${msg}`);
       }
 
@@ -179,7 +240,7 @@ class AsterdexService {
         logger.warn(`[ASTERDEX] Time difference with server: ${timeDiff}ms`);
       }
       
-      // Перевірка аутентифікації через отримання балансу
+      // ⚠️ ЗМІНЕНО: Перевірка аутентифікації
       await this.getUSDTBalance();
       
       this.isConnected = true;
@@ -198,7 +259,8 @@ class AsterdexService {
    */
   async getUSDTBalance() {
     try {
-      const response = await this.signedRequest('GET', '/fapi/v2/balance');
+      // ⚠️ ЗМІНЕНО: Використовуємо v3 endpoint
+      const response = await this.signedRequest('GET', '/fapi/v3/balance', {});
       
       if (!Array.isArray(response)) {
         throw new Error('Invalid balance response format');
@@ -226,7 +288,8 @@ class AsterdexService {
    */
   async getSymbolInfo(symbol) {
     try {
-      const response = await this.publicRequest('GET', '/fapi/v1/exchangeInfo');
+      // ⚠️ ЗМІНЕНО: Використовуємо v3 endpoint
+      const response = await this.publicRequest('GET', '/fapi/v3/exchangeInfo');
       
       const symbolData = response.symbols?.find(s => s.symbol === symbol);
       
@@ -241,7 +304,7 @@ class AsterdexService {
 
       return {
         symbol: symbolData.symbol,
-        status: symbolData.status,
+        status: symbolData.status || symbolData.contractStatus,  // ⚠️ ДОДАНО: contractStatus
         baseAsset: symbolData.baseAsset,
         quoteAsset: symbolData.quoteAsset,
         pricePrecision: symbolData.pricePrecision || 4,
@@ -263,7 +326,8 @@ class AsterdexService {
    */
   async getCurrentPrice(symbol) {
     try {
-      const response = await this.publicRequest('GET', '/fapi/v1/ticker/price', { symbol });
+      // ⚠️ ЗМІНЕНО: Використовуємо v3 endpoint
+      const response = await this.publicRequest('GET', '/fapi/v3/ticker/price', { symbol });
       
       const price = parseFloat(response.price);
       logger.info(`[ASTERDEX] Current price for ${symbol}: ${price}`);
@@ -282,7 +346,8 @@ class AsterdexService {
     try {
       logger.info(`[ASTERDEX] Setting leverage ${leverage}x for ${symbol}...`);
       
-      const response = await this.signedRequest('POST', '/fapi/v1/leverage', {
+      // ⚠️ ЗМІНЕНО: Використовуємо v3 endpoint
+      const response = await this.signedRequest('POST', '/fapi/v3/leverage', {
         symbol,
         leverage: leverage.toString()
       });
@@ -290,7 +355,6 @@ class AsterdexService {
       logger.info(`[ASTERDEX] ✅ Leverage ${leverage}x set for ${symbol}`);
       return response;
     } catch (error) {
-      // Якщо leverage вже встановлене - ігноруємо помилку
       if (error.message?.includes('leverage not modified') || 
           error.message?.includes('No need to change leverage')) {
         logger.info(`[ASTERDEX] ✅ Leverage already ${leverage}x for ${symbol}`);
@@ -303,8 +367,7 @@ class AsterdexService {
   }
 
   /**
-   * Відкриває Market ордер (ВХІД В ПОЗИЦІЮ)
-   * Комісія: 0.035% (taker)
+   * Відкриває Market ордер
    */
   async openMarketOrder(symbol, side, quantity, positionSide = 'BOTH') {
     try {
@@ -318,7 +381,8 @@ class AsterdexService {
         positionSide
       };
 
-      const response = await this.signedRequest('POST', '/fapi/v1/order', params);
+      // ⚠️ ЗМІНЕНО: Використовуємо v3 endpoint
+      const response = await this.signedRequest('POST', '/fapi/v3/order', params);
 
       const orderId = response.orderId;
       const avgPrice = parseFloat(response.avgPrice || '0');
@@ -340,33 +404,30 @@ class AsterdexService {
   }
 
   /**
-   * Встановлює Take Profit (LIMIT ORDER!)
-   * Комісія: 0.01% (maker) - економія 7x порівняно з MARKET
+   * Встановлює Take Profit
    */
   async setTakeProfit(symbol, side, price, quantity, positionSide = 'BOTH') {
     try {
-      logger.info(`[ASTERDEX] Setting Take Profit LIMIT: @ ${price} for ${symbol}...`);
+      logger.info(`[ASTERDEX] Setting Take Profit: @ ${price} for ${symbol}...`);
       
-      // КРИТИЧНО: Використовуємо ПРОТИЛЕЖНУ сторону!
-      // Для LONG позиції (BUY entry) -> TP має бути SELL
-      // Для SHORT позиції (SELL entry) -> TP має бути BUY
       const tpSide = side === 'BUY' ? 'SELL' : 'BUY';
       
       const params = {
         symbol,
         side: tpSide,
         positionSide,
-        type: 'TAKE_PROFIT', // ← LIMIT версія!
+        type: 'TAKE_PROFIT',
         quantity: quantity.toString(),
         price: price.toString(),
-        stopPrice: price.toString(), // Trigger ціна
+        stopPrice: price.toString(),
         timeInForce: 'GTC',
         workingType: 'CONTRACT_PRICE'
       };
 
-      const response = await this.signedRequest('POST', '/fapi/v1/order', params);
+      // ⚠️ ЗМІНЕНО: Використовуємо v3 endpoint
+      const response = await this.signedRequest('POST', '/fapi/v3/order', params);
 
-      logger.info(`[ASTERDEX] ✅ Take Profit LIMIT set: Order ID ${response.orderId}`);
+      logger.info(`[ASTERDEX] ✅ Take Profit set: Order ID ${response.orderId}`);
       
       return {
         orderId: response.orderId,
@@ -380,33 +441,30 @@ class AsterdexService {
   }
 
   /**
-   * Встановлює Stop Loss (LIMIT ORDER!)
-   * Комісія: 0.01% (maker) - економія 7x порівняно з MARKET
+   * Встановлює Stop Loss
    */
   async setStopLoss(symbol, side, price, quantity, positionSide = 'BOTH') {
     try {
-      logger.info(`[ASTERDEX] Setting Stop Loss LIMIT: @ ${price} for ${symbol}...`);
+      logger.info(`[ASTERDEX] Setting Stop Loss: @ ${price} for ${symbol}...`);
       
-      // КРИТИЧНО: Використовуємо ПРОТИЛЕЖНУ сторону!
-      // Для LONG позиції (BUY entry) -> SL має бути SELL
-      // Для SHORT позиції (SELL entry) -> SL має бути BUY
       const slSide = side === 'BUY' ? 'SELL' : 'BUY';
       
       const params = {
         symbol,
         side: slSide,
         positionSide,
-        type: 'STOP', // ← LIMIT версія!
+        type: 'STOP',
         quantity: quantity.toString(),
         price: price.toString(),
-        stopPrice: price.toString(), // Trigger ціна
+        stopPrice: price.toString(),
         timeInForce: 'GTC',
         workingType: 'CONTRACT_PRICE'
       };
 
-      const response = await this.signedRequest('POST', '/fapi/v1/order', params);
+      // ⚠️ ЗМІНЕНО: Використовуємо v3 endpoint
+      const response = await this.signedRequest('POST', '/fapi/v3/order', params);
 
-      logger.info(`[ASTERDEX] ✅ Stop Loss LIMIT set: Order ID ${response.orderId}`);
+      logger.info(`[ASTERDEX] ✅ Stop Loss set: Order ID ${response.orderId}`);
       
       return {
         orderId: response.orderId,
@@ -425,13 +483,13 @@ class AsterdexService {
   async getOpenPositions(symbol = null) {
     try {
       const params = symbol ? { symbol } : {};
-      const response = await this.signedRequest('GET', '/fapi/v2/positionRisk', params);
+      // ⚠️ ЗМІНЕНО: Використовуємо v3 endpoint
+      const response = await this.signedRequest('GET', '/fapi/v3/positionRisk', params);
 
       if (!Array.isArray(response)) {
         throw new Error('Invalid position response format');
       }
 
-      // Фільтруємо тільки відкриті позиції
       const positions = response
         .filter(pos => Math.abs(parseFloat(pos.positionAmt || '0')) > 0)
         .map(pos => ({
@@ -443,7 +501,6 @@ class AsterdexService {
           unRealizedProfit: parseFloat(pos.unRealizedProfit || '0'),
           liquidationPrice: parseFloat(pos.liquidationPrice || '0'),
           leverage: parseFloat(pos.leverage || '1'),
-          // Визначаємо side на основі positionAmt
           side: parseFloat(pos.positionAmt || '0') > 0 ? 'LONG' : 'SHORT',
           size: Math.abs(parseFloat(pos.positionAmt || '0'))
         }));
@@ -473,7 +530,8 @@ class AsterdexService {
         params.symbol = symbol;
       }
 
-      const response = await this.signedRequest('GET', '/fapi/v1/userTrades', params);
+      // ⚠️ ЗМІНЕНО: Використовуємо v3 endpoint
+      const response = await this.signedRequest('GET', '/fapi/v3/userTrades', params);
 
       return Array.isArray(response) ? response : [];
     } catch (error) {
@@ -490,7 +548,7 @@ class AsterdexService {
     if (mode === 'HEDGE') {
       return direction; // "LONG" або "SHORT"
     }
-    return 'BOTH'; // One-way mode
+    return 'BOTH';
   }
 
   /**
@@ -501,6 +559,5 @@ class AsterdexService {
   }
 }
 
-// Експортуємо singleton
 const asterdexService = new AsterdexService();
 export default asterdexService;
