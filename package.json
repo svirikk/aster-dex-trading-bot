@@ -15,7 +15,8 @@
     "trading",
     "bot",
     "futures",
-    "telegram"
+    "telegram",
+    "web3"
   ],
   "author": "",
   "license": "ISC",
@@ -23,6 +24,7 @@
     "axios": "^1.7.7",
     "node-telegram-bot-api": "^0.66.0",
     "dotenv": "^16.4.5",
-    "winston": "^3.15.0"
+    "winston": "^3.15.0",
+    "ethers": "^6.13.4"
   }
 }
