@@ -47,13 +47,16 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
 
     // 5. З урахуванням плеча
     const leverage = config.risk.leverage;
-    const requiredMargin = positionSize / leverage;
+    let requiredMargin = positionSize / leverage;
 
-    // Перевірка достатності балансу
-    if (requiredMargin > balance) {
-      logger.warn(`[RISK] Required margin (${requiredMargin} USDT) exceeds balance (${balance} USDT)`);
-      // Перерахувати з максимально доступним балансом
-      positionSize = balance * leverage;
+    // ✅ ВИПРАВЛЕННЯ: Перевірка достатності балансу з толерантністю 0.001 USDT
+    const marginTolerance = 0.001; // 0.001 USDT толерантність для округлення
+    
+    if (requiredMargin > balance + marginTolerance) {
+      logger.warn(`[RISK] Required margin (${requiredMargin.toFixed(8)} USDT) exceeds balance (${balance} USDT)`);
+      // Перерахувати з максимально доступним балансом (віднімаємо 0.5% для безпеки)
+      positionSize = (balance * 0.995) * leverage;
+      requiredMargin = positionSize / leverage;
     }
 
     // 6. Розрахувати кількість контрактів
@@ -89,10 +92,13 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
       positionSize = quantity * entryPrice;
     }
 
-    // Фінальна перевірка маржі
+    // Фінальна перевірка маржі з толерантністю
     const finalRequiredMargin = (quantity * entryPrice) / leverage;
-    if (finalRequiredMargin > balance) {
-      throw new Error(`Insufficient balance. Required: ${finalRequiredMargin} USDT, Available: ${balance} USDT`);
+    
+    // ✅ ВИПРАВЛЕННЯ: Використовуємо толерантність при фінальній перевірці
+    if (finalRequiredMargin > balance + marginTolerance) {
+      logger.error(`[RISK] Final margin check failed: Required ${finalRequiredMargin.toFixed(8)} USDT > Available ${balance} USDT`);
+      throw new Error(`Insufficient balance. Required: ${finalRequiredMargin.toFixed(8)} USDT, Available: ${balance} USDT`);
     }
 
     const result = {
@@ -107,7 +113,7 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
       direction: direction
     };
 
-    logger.info(`[RISK] Calculated position: ${quantity} @ ${roundedEntryPrice}, Margin: ${finalRequiredMargin} USDT, TP: ${roundedTakeProfit}, SL: ${roundedStopLoss}`);
+    logger.info(`[RISK] Calculated position: ${quantity} @ ${roundedEntryPrice}, Margin: ${finalRequiredMargin.toFixed(8)} USDT, TP: ${roundedTakeProfit}, SL: ${roundedStopLoss}`);
 
     return result;
   } catch (error) {
@@ -120,7 +126,9 @@ export function calculatePositionParameters(balance, entryPrice, direction, symb
  * Перевіряє чи достатньо балансу для відкриття позиції
  */
 export function hasSufficientBalance(balance, requiredMargin) {
-  return isValidNumber(balance) && isValidNumber(requiredMargin) && balance >= requiredMargin;
+  // ✅ ВИПРАВЛЕННЯ: Додаємо толерантність 0.001 USDT
+  const marginTolerance = 0.001;
+  return isValidNumber(balance) && isValidNumber(requiredMargin) && balance >= (requiredMargin - marginTolerance);
 }
 
 export default {
