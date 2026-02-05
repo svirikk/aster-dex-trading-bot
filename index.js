@@ -216,7 +216,7 @@ async function validateSignal(signal) {
   // 8. Перевірка що символ існує та торгується
   try {
     const symbolInfo = await asterdexService.getSymbolInfo(symbol);  // ← ЗМІНЕНО
-    if (symbolInfo.status !== 'Trading') {
+    if (symbolInfo.status !== 'TRADING') {
       return {
         valid: false,
         reason: `Symbol ${symbol} is not trading`,
