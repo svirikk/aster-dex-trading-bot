@@ -2,10 +2,11 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Валідація обов'язкових змінних
+// Валідація обов'язкових змінних для Web3 автентифікації
 const requiredEnvVars = [
-  'ASTERDEX_API_KEY',
-  'ASTERDEX_API_SECRET',
+  'ASTERDEX_USER_ADDRESS',      // ⚠️ ЗМІНЕНО: Main wallet address
+  'ASTERDEX_SIGNER_ADDRESS',    // ⚠️ ЗМІНЕНО: API wallet address
+  'ASTERDEX_PRIVATE_KEY',       // ⚠️ ЗМІНЕНО: Private key API wallet
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_CHANNEL_ID'
 ];
@@ -17,15 +18,15 @@ for (const envVar of requiredEnvVars) {
 }
 
 export const config = {
-  // AsterDex API
+  // AsterDex API (Web3 Authentication)
   asterdex: {
-    apiKey: process.env.ASTERDEX_API_KEY,
-    apiSecret: process.env.ASTERDEX_API_SECRET,
+    userAddress: process.env.ASTERDEX_USER_ADDRESS,          // Main wallet address
+    signerAddress: process.env.ASTERDEX_SIGNER_ADDRESS,      // API wallet address  
+    privateKey: process.env.ASTERDEX_PRIVATE_KEY,            // Private key
     testnet: process.env.ASTERDEX_TESTNET === 'true',
-    // ONE_WAY (positionSide=BOTH) або HEDGE (LONG/SHORT)
     positionMode: (process.env.ASTERDEX_POSITION_MODE || 'ONE_WAY').toUpperCase(),
     baseURL: process.env.ASTERDEX_TESTNET === 'true' 
-      ? 'https://testnet-fapi.asterdex.com'  // Перевірте чи існує testnet URL
+      ? 'https://testnet-fapi.asterdex.com'
       : 'https://fapi.asterdex.com'
   },
 
@@ -83,6 +84,19 @@ if (config.tradingHours.startHour < 0 || config.tradingHours.startHour > 23) {
 
 if (config.tradingHours.endHour < 0 || config.tradingHours.endHour > 23) {
   throw new Error('TRADING_END_HOUR must be between 0 and 23');
+}
+
+// Валідація Ethereum адрес
+if (!config.asterdex.userAddress.startsWith('0x') || config.asterdex.userAddress.length !== 42) {
+  throw new Error('ASTERDEX_USER_ADDRESS must be a valid Ethereum address (0x...)');
+}
+
+if (!config.asterdex.signerAddress.startsWith('0x') || config.asterdex.signerAddress.length !== 42) {
+  throw new Error('ASTERDEX_SIGNER_ADDRESS must be a valid Ethereum address (0x...)');
+}
+
+if (!config.asterdex.privateKey.startsWith('0x') || config.asterdex.privateKey.length !== 66) {
+  throw new Error('ASTERDEX_PRIVATE_KEY must be a valid Ethereum private key (0x... 64 hex chars)');
 }
 
 export default config;
